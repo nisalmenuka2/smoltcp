@@ -1,8 +1,5 @@
-use core::cell::RefCell;
-
-use {Error, Result};
-use phy::{self, DeviceCapabilities, Device};
-use time::{Duration, Instant};
+use Error;
+use super::Device;
 
 // We use our own RNG to stay compatible with #![no_std].
 // The use of the RNG below has a slight bias, but it doesn't matter.
@@ -15,105 +12,56 @@ fn xorshift32(state: &mut u32) -> u32 {
     x
 }
 
+fn check_rng(state: &mut u32, pct: u8) -> bool {
+    xorshift32(state) % 100 < pct as u32
+}
+
+fn corrupt<T: AsMut<[u8]>>(state: &mut u32, mut buffer: T) {
+    let mut buffer = buffer.as_mut();
+    // We introduce a single bitflip, as the most likely, and the hardest to detect, error.
+    let index = (xorshift32(state) as usize) % buffer.len();
+    let bit   = 1 << (xorshift32(state) % 8) as u8;
+    buffer[index] ^= bit;
+}
+
 // This could be fixed once associated consts are stable.
 const MTU: usize = 1536;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Config {
     corrupt_pct: u8,
     drop_pct:    u8,
-    reorder_pct: u8,
-    max_size:    usize,
-    max_tx_rate: u64,
-    max_rx_rate: u64,
-    interval:    Duration,
-}
-
-#[derive(Debug, Clone)]
-struct State {
-    rng_seed:    u32,
-    refilled_at: Instant,
-    tx_bucket:   u64,
-    rx_bucket:   u64,
-}
-
-impl State {
-    fn maybe(&mut self, pct: u8) -> bool {
-        xorshift32(&mut self.rng_seed) % 100 < pct as u32
-    }
-
-    fn corrupt<T: AsMut<[u8]>>(&mut self, mut buffer: T) {
-        let buffer = buffer.as_mut();
-        // We introduce a single bitflip, as the most likely, and the hardest to detect, error.
-        let index = (xorshift32(&mut self.rng_seed) as usize) % buffer.len();
-        let bit   = 1 << (xorshift32(&mut self.rng_seed) % 8) as u8;
-        buffer[index] ^= bit;
-    }
-
-    fn refill(&mut self, config: &Config, timestamp: Instant) {
-        if timestamp - self.refilled_at > config.interval {
-            self.tx_bucket = config.max_tx_rate;
-            self.rx_bucket = config.max_rx_rate;
-            self.refilled_at = timestamp;
-        }
-    }
-
-    fn maybe_transmit(&mut self, config: &Config, timestamp: Instant) -> bool {
-        if config.max_tx_rate == 0 { return true }
-
-        self.refill(config, timestamp);
-        if self.tx_bucket > 0 {
-            self.tx_bucket -= 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn maybe_receive(&mut self, config: &Config, timestamp: Instant) -> bool {
-        if config.max_rx_rate == 0 { return true }
-
-        self.refill(config, timestamp);
-        if self.rx_bucket > 0 {
-            self.rx_bucket -= 1;
-            true
-        } else {
-            false
-        }
-    }
+    reorder_pct: u8
 }
 
 /// A fault injector device.
 ///
-/// A fault injector is a device that alters packets traversing through it to simulate
-/// adverse network conditions (such as random packet loss or corruption), or software
-/// or hardware limitations (such as a limited number or size of usable network buffers).
+/// A fault injector is a device that randomly drops or corrupts packets traversing it,
+/// according to preset probabilities.
 #[derive(Debug)]
-pub struct FaultInjector<D: for<'a> Device<'a>> {
-    inner:      D,
-    state:      RefCell<State>,
-    config:     Config,
+pub struct FaultInjector<T: Device> {
+    lower:  T,
+    state:  u32,
+    config: Config
 }
 
-impl<D: for<'a> Device<'a>> FaultInjector<D> {
-    /// Create a fault injector device, using the given random number generator seed.
-    pub fn new(inner: D, seed: u32) -> FaultInjector<D> {
-        let state = State {
-            rng_seed:    seed,
-            refilled_at: Instant::from_millis(0),
-            tx_bucket:   0,
-            rx_bucket:   0,
-        };
+impl<T: Device> FaultInjector<T> {
+    /// Create a tracer device, using the given random number generator seed.
+    pub fn new(lower: T, seed: u32) -> FaultInjector<T> {
         FaultInjector {
-            inner: inner,
-            state: RefCell::new(state),
-            config: Config::default(),
+            lower: lower,
+            state: seed,
+            config: Config {
+                corrupt_pct: 0,
+                drop_pct:    0,
+                reorder_pct: 0
+            }
         }
     }
 
-    /// Return the underlying device, consuming the fault injector.
-    pub fn into_inner(self) -> D {
-        self.inner
+    /// Return the underlying device, consuming the tracer.
+    pub fn into_lower(self) -> T {
+        self.lower
     }
 
     /// Return the probability of corrupting a packet, in percents.
@@ -124,26 +72,6 @@ impl<D: for<'a> Device<'a>> FaultInjector<D> {
     /// Return the probability of dropping a packet, in percents.
     pub fn drop_chance(&self) -> u8 {
         self.config.drop_pct
-    }
-
-    /// Return the maximum packet size, in octets.
-    pub fn max_packet_size(&self) -> usize {
-        self.config.max_size
-    }
-
-    /// Return the maximum packet transmission rate, in packets per second.
-    pub fn max_tx_rate(&self) -> u64 {
-        self.config.max_rx_rate
-    }
-
-    /// Return the maximum packet reception rate, in packets per second.
-    pub fn max_rx_rate(&self) -> u64 {
-        self.config.max_tx_rate
-    }
-
-    /// Return the interval for packet rate limiting, in milliseconds.
-    pub fn bucket_interval(&self) -> Duration {
-        self.config.interval
     }
 
     /// Set the probability of corrupting a packet, in percents.
@@ -163,148 +91,91 @@ impl<D: for<'a> Device<'a>> FaultInjector<D> {
         if pct > 100 { panic!("percentage out of range") }
         self.config.drop_pct = pct
     }
-
-    /// Set the maximum packet size, in octets.
-    pub fn set_max_packet_size(&mut self, size: usize) {
-        self.config.max_size = size
-    }
-
-    /// Set the maximum packet transmission rate, in packets per interval.
-    pub fn set_max_tx_rate(&mut self, rate: u64) {
-        self.config.max_tx_rate = rate
-    }
-
-    /// Set the maximum packet reception rate, in packets per interval.
-    pub fn set_max_rx_rate(&mut self, rate: u64) {
-        self.config.max_rx_rate = rate
-    }
-
-    /// Set the interval for packet rate limiting, in milliseconds.
-    pub fn set_bucket_interval(&mut self, interval: Duration) {
-        self.state.borrow_mut().refilled_at = Instant::from_millis(0);
-        self.config.interval = interval
-    }
 }
 
-impl<'a, D> Device<'a> for FaultInjector<D>
-    where D: for<'b> Device<'b>,
-{
-    type RxToken = RxToken<'a, <D as Device<'a>>::RxToken>;
-    type TxToken = TxToken<'a, <D as Device<'a>>::TxToken>;
+impl<T: Device> Device for FaultInjector<T>
+        where T::RxBuffer: AsMut<[u8]> {
+    type RxBuffer = T::RxBuffer;
+    type TxBuffer = TxBuffer<T::TxBuffer>;
 
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = self.inner.capabilities();
-        if caps.max_transmission_unit > MTU {
-            caps.max_transmission_unit = MTU;
-        }
-        caps
-    }
-
-    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        let &mut Self { ref mut inner, ref state, config } = self;
-        inner.receive().map(|(rx_token, tx_token)| {
-            let rx = RxToken {
-                state:   &state,
-                config:  config,
-                token:   rx_token,
-                corrupt: [0; MTU],
-            };
-            let tx = TxToken {
-                state:   &state,
-                config:  config,
-                token:   tx_token,
-                junk:    [0; MTU],
-            };
-            (rx, tx)
-        })
-    }
-
-    fn transmit(&'a mut self) -> Option<Self::TxToken> {
-        let &mut Self { ref mut inner, ref state, config } = self;
-        inner.transmit().map(|token| TxToken {
-            state:  &state,
-            config: config,
-            token: token,
-            junk:   [0; MTU],
-        })
-    }
-}
-
-#[doc(hidden)]
-pub struct RxToken<'a, Rx: phy::RxToken> {
-    state:   &'a RefCell<State>,
-    config:  Config,
-    token:   Rx,
-    corrupt: [u8; MTU],
-}
-
-impl<'a, Rx: phy::RxToken> phy::RxToken for RxToken<'a, Rx> {
-    fn consume<R, F>(self, timestamp: Instant, f: F) -> Result<R>
-        where F: FnOnce(&[u8]) -> Result<R>
-    {
-        if self.state.borrow_mut().maybe(self.config.drop_pct) {
-            net_trace!("rx: randomly dropping a packet");
-            return Err(Error::Exhausted)
-        }
-        if !self.state.borrow_mut().maybe_receive(&self.config, timestamp) {
-            net_trace!("rx: dropping a packet because of rate limiting");
-            return Err(Error::Exhausted)
-        }
-        let Self { token, config, state, mut corrupt } = self;
-        token.consume(timestamp, |buffer| {
-            if config.max_size > 0 && buffer.as_ref().len() > config.max_size {
-                net_trace!("rx: dropping a packet that is too large");
-                return Err(Error::Exhausted)
-            }
-            if state.borrow_mut().maybe(config.corrupt_pct) {
-                net_trace!("rx: randomly corrupting a packet");
-                let mut corrupt = &mut corrupt[..buffer.len()];
-                corrupt.copy_from_slice(buffer);
-                state.borrow_mut().corrupt(&mut corrupt);
-                f(&mut corrupt)
-            } else {
-                f(buffer)
-            }
-        })
-    }
-}
-
-#[doc(hidden)]
-pub struct TxToken<'a, Tx: phy::TxToken> {
-    state:  &'a RefCell<State>,
-    config: Config,
-    token:  Tx,
-    junk:   [u8; MTU],
-}
-
-impl<'a, Tx: phy::TxToken> phy::TxToken for TxToken<'a, Tx> {
-    fn consume<R, F>(mut self, timestamp: Instant, len: usize, f: F) -> Result<R>
-        where F: FnOnce(&mut [u8]) -> Result<R>
-    {
-        let drop = if self.state.borrow_mut().maybe(self.config.drop_pct) {
-            net_trace!("tx: randomly dropping a packet");
-            true
-        } else if self.config.max_size > 0 && len > self.config.max_size {
-            net_trace!("tx: dropping a packet that is too large");
-            true
-        } else if !self.state.borrow_mut().maybe_transmit(&self.config, timestamp) {
-            net_trace!("tx: dropping a packet because of rate limiting");
-            true
+    fn mtu(&self) -> usize {
+        if self.lower.mtu() < MTU {
+            self.lower.mtu()
         } else {
-            false
-        };
-
-        if drop {
-            return f(&mut self.junk);
+            MTU
         }
+    }
 
-        let Self { token, state, config, .. } = self;
-        token.consume(timestamp, len, |mut buf| {
-            if state.borrow_mut().maybe(config.corrupt_pct) {
-                net_trace!("tx: corrupting a packet");
-                state.borrow_mut().corrupt(&mut buf)
-            }
-            f(buf)
+    fn receive(&mut self) -> Result<Self::RxBuffer, Error> {
+        let mut buffer = try!(self.lower.receive());
+        if check_rng(&mut self.state, self.config.drop_pct) {
+            net_trace!("rx: dropping a packet");
+            return Err(Error::Exhausted)
+        }
+        if check_rng(&mut self.state, self.config.corrupt_pct) {
+            net_trace!("rx: corrupting a packet");
+            corrupt(&mut self.state, &mut buffer)
+        }
+        Ok(buffer)
+    }
+
+    fn transmit(&mut self, length: usize) -> Result<Self::TxBuffer, Error> {
+        let buffer;
+        if check_rng(&mut self.state, self.config.drop_pct) {
+            net_trace!("tx: dropping a packet");
+            buffer = None;
+        } else {
+            buffer = Some(try!(self.lower.transmit(length)));
+        }
+        Ok(TxBuffer {
+            buffer: buffer,
+            state:  xorshift32(&mut self.state),
+            config: self.config,
+            junk:   [0; MTU],
+            length: length
         })
+    }
+}
+
+#[doc(hidden)]
+pub struct TxBuffer<T: AsRef<[u8]> + AsMut<[u8]>> {
+    state:  u32,
+    config: Config,
+    buffer: Option<T>,
+    junk:   [u8; MTU],
+    length: usize
+}
+
+impl<T: AsRef<[u8]> + AsMut<[u8]>> AsRef<[u8]>
+        for TxBuffer<T> {
+    fn as_ref(&self) -> &[u8] {
+        match self.buffer {
+            Some(ref buf) => buf.as_ref(),
+            None => &self.junk[..self.length]
+        }
+    }
+}
+
+impl<T: AsRef<[u8]> + AsMut<[u8]>> AsMut<[u8]>
+        for TxBuffer<T> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        match self.buffer {
+            Some(ref mut buf) => buf.as_mut(),
+            None => &mut self.junk[..self.length]
+        }
+    }
+}
+
+impl<T: AsRef<[u8]> + AsMut<[u8]>> Drop for TxBuffer<T> {
+    fn drop(&mut self) {
+        match self.buffer {
+            Some(ref mut buf) => {
+                if check_rng(&mut self.state, self.config.corrupt_pct) {
+                    net_trace!("tx: corrupting a packet");
+                    corrupt(&mut self.state, buf)
+                }
+            },
+            None => ()
+        }
     }
 }

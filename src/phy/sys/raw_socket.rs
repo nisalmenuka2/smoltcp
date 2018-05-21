@@ -1,6 +1,5 @@
-use std::{mem, io};
-use std::os::unix::io::{RawFd, AsRawFd};
 use libc;
+use std::{mem, io};
 use super::*;
 
 #[derive(Debug)]
@@ -9,16 +8,10 @@ pub struct RawSocketDesc {
     ifreq: ifreq
 }
 
-impl AsRawFd for RawSocketDesc {
-    fn as_raw_fd(&self) -> RawFd {
-        self.lower
-    }
-}
-
 impl RawSocketDesc {
     pub fn new(name: &str) -> io::Result<RawSocketDesc> {
         let lower = unsafe {
-            let lower = libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_NONBLOCK,
+            let lower = libc::socket(libc::AF_PACKET, libc::SOCK_RAW,
                                      imp::ETH_P_ALL.to_be() as i32);
             if lower == -1 { return Err(io::Error::last_os_error()) }
             lower
@@ -38,7 +31,7 @@ impl RawSocketDesc {
         let sockaddr = libc::sockaddr_ll {
             sll_family:   libc::AF_PACKET as u16,
             sll_protocol: imp::ETH_P_ALL.to_be() as u16,
-            sll_ifindex:  ifreq_ioctl(self.lower, &mut self.ifreq, imp::SIOCGIFINDEX)?,
+            sll_ifindex:  try!(ifreq_ioctl(self.lower, &mut self.ifreq, imp::SIOCGIFINDEX)),
             sll_hatype:   1,
             sll_pkttype:  0,
             sll_halen:    6,

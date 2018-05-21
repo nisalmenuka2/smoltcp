@@ -1,89 +1,83 @@
-use Result;
+use Error;
 use wire::pretty_print::{PrettyPrint, PrettyPrinter};
-use phy::{self, DeviceCapabilities, Device};
-use time::Instant;
+use super::Device;
 
 /// A tracer device.
 ///
-/// A tracer is a device that pretty prints all packets traversing it
-/// using the provided writer function, and then passes them to another
-/// device.
-pub struct Tracer<D: for<'a> Device<'a>, P: PrettyPrint> {
-    inner:  D,
-    writer: fn(Instant, PrettyPrinter<P>),
+/// A tracer is a device that prints all packets traversing it
+/// to the standard output, and delegates to another device otherwise.
+pub struct Tracer<T: Device, U: PrettyPrint> {
+    lower:   T,
+    writer:  fn(PrettyPrinter<U>)
 }
 
-impl<D: for<'a> Device<'a>, P: PrettyPrint> Tracer<D, P> {
+impl<T: Device, U: PrettyPrint> Tracer<T, U> {
     /// Create a tracer device.
-    pub fn new(inner: D, writer: fn(timestamp: Instant, printer: PrettyPrinter<P>)) -> Tracer<D, P> {
-        Tracer { inner, writer }
+    pub fn new(lower: T, writer: fn(PrettyPrinter<U>)) -> Tracer<T, U> {
+        Tracer {
+            lower:   lower,
+            writer:  writer
+        }
+    }
+
+    /// Create a tracer device, printing to standard output.
+    #[cfg(feature = "std")]
+    pub fn new_stdout(lower: T) -> Tracer<T, U> {
+        fn writer<U: PrettyPrint>(printer: PrettyPrinter<U>) {
+            print!("{}", printer)
+        }
+
+        Tracer {
+            lower:   lower,
+            writer:  writer
+        }
     }
 
     /// Return the underlying device, consuming the tracer.
-    pub fn into_inner(self) -> D {
-        self.inner
+    pub fn into_lower(self) -> T {
+        self.lower
     }
 }
 
-impl<'a, D, P> Device<'a> for Tracer<D, P>
-    where D: for<'b> Device<'b>,
-          P: PrettyPrint + 'a,
-{
-    type RxToken = RxToken<<D as Device<'a>>::RxToken, P>;
-    type TxToken = TxToken<<D as Device<'a>>::TxToken, P>;
+impl<T: Device, U: PrettyPrint> Device for Tracer<T, U> {
+    type RxBuffer = T::RxBuffer;
+    type TxBuffer = TxBuffer<T::TxBuffer, U>;
 
-    fn capabilities(&self) -> DeviceCapabilities { self.inner.capabilities() }
+    fn mtu(&self) -> usize { self.lower.mtu() }
 
-    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        let &mut Self { ref mut inner, writer, .. } = self;
-        inner.receive().map(|(rx_token, tx_token)| {
-            let rx = RxToken { token: rx_token, writer: writer };
-            let tx = TxToken { token: tx_token, writer: writer };
-            (rx, tx)
-        })
+    fn receive(&mut self) -> Result<Self::RxBuffer, Error> {
+        let buffer = try!(self.lower.receive());
+        (self.writer)(PrettyPrinter::<U>::new("<- ", &buffer));
+        Ok(buffer)
     }
 
-    fn transmit(&'a mut self) -> Option<Self::TxToken> {
-        let &mut Self { ref mut inner, writer } = self;
-        inner.transmit().map(|tx_token| {
-            TxToken { token: tx_token, writer: writer }
+    fn transmit(&mut self, length: usize) -> Result<Self::TxBuffer, Error> {
+        let buffer = try!(self.lower.transmit(length));
+        Ok(TxBuffer {
+            buffer:  buffer,
+            writer:  self.writer
         })
     }
 }
 
 #[doc(hidden)]
-pub struct RxToken<Rx: phy::RxToken, P: PrettyPrint> {
-    token:     Rx,
-    writer:    fn(Instant, PrettyPrinter<P>)
+pub struct TxBuffer<T: AsRef<[u8]>, U: PrettyPrint> {
+    buffer:  T,
+    writer:  fn(PrettyPrinter<U>)
 }
 
-impl<Rx: phy::RxToken, P: PrettyPrint> phy::RxToken for RxToken<Rx, P> {
-    fn consume<R, F>(self, timestamp: Instant, f: F) -> Result<R>
-        where F: FnOnce(&[u8]) -> Result<R>
-    {
-        let Self { token, writer } = self;
-        token.consume(timestamp, |buffer| {
-            writer(timestamp, PrettyPrinter::<P>::new("<- ", &buffer));
-            f(buffer)
-        })
-    }
+impl<T: AsRef<[u8]>, U: PrettyPrint> AsRef<[u8]>
+        for TxBuffer<T, U> {
+    fn as_ref(&self) -> &[u8] { self.buffer.as_ref() }
 }
 
-#[doc(hidden)]
-pub struct TxToken<Tx: phy::TxToken, P: PrettyPrint> {
-    token:     Tx,
-    writer:    fn(Instant, PrettyPrinter<P>)
+impl<T: AsRef<[u8]> + AsMut<[u8]>, U: PrettyPrint> AsMut<[u8]>
+        for TxBuffer<T, U> {
+    fn as_mut(&mut self) -> &mut [u8] { self.buffer.as_mut() }
 }
 
-impl<Tx: phy::TxToken, P: PrettyPrint> phy::TxToken for TxToken<Tx, P> {
-    fn consume<R, F>(self, timestamp: Instant, len: usize, f: F) -> Result<R>
-        where F: FnOnce(&mut [u8]) -> Result<R>
-    {
-        let Self { token, writer } = self;
-        token.consume(timestamp, len, |buffer| {
-            let result = f(buffer);
-            writer(timestamp, PrettyPrinter::<P>::new("-> ", &buffer));
-            result
-        })
+impl<T: AsRef<[u8]>, U: PrettyPrint> Drop for TxBuffer<T, U> {
+    fn drop(&mut self) {
+        (self.writer)(PrettyPrinter::<U>::new("-> ", &self.buffer));
     }
 }

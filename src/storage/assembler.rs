@@ -54,7 +54,7 @@ impl Contig {
     }
 
     fn shrink_hole_to(&mut self, size: usize) {
-        debug_assert!(self.hole_size >= size);
+        assert!(self.hole_size >= size);
 
         let total_size = self.total_size();
         self.hole_size = size;
@@ -93,8 +93,6 @@ impl Assembler {
         Assembler { contigs }
     }
 
-    /// FIXME(whitequark): remove this once I'm certain enough that the assembler works well.
-    #[allow(dead_code)]
     pub(crate) fn total_size(&self) -> usize {
         self.contigs
             .iter()

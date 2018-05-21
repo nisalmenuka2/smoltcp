@@ -2,11 +2,9 @@ use std::cell::RefCell;
 use std::vec::Vec;
 use std::rc::Rc;
 use std::io;
-use std::os::unix::io::{RawFd, AsRawFd};
 
-use Result;
-use phy::{self, sys, DeviceCapabilities, Device};
-use time::Instant;
+use Error;
+use super::{sys, Device};
 
 /// A socket that captures or transmits the complete frame.
 #[derive(Debug)]
@@ -15,21 +13,15 @@ pub struct RawSocket {
     mtu:    usize
 }
 
-impl AsRawFd for RawSocket {
-    fn as_raw_fd(&self) -> RawFd {
-        self.lower.borrow().as_raw_fd()
-    }
-}
-
 impl RawSocket {
     /// Creates a raw socket, bound to the interface called `name`.
     ///
     /// This requires superuser privileges or a corresponding capability bit
     /// set on the executable.
     pub fn new(name: &str) -> io::Result<RawSocket> {
-        let mut lower = sys::RawSocketDesc::new(name)?;
-        lower.bind_interface()?;
-        let mtu = lower.interface_mtu()?;
+        let mut lower = try!(sys::RawSocketDesc::new(name));
+        try!(lower.bind_interface());
+        let mtu = try!(lower.interface_mtu());
         Ok(RawSocket {
             lower: Rc::new(RefCell::new(lower)),
             mtu:   mtu
@@ -37,65 +29,45 @@ impl RawSocket {
     }
 }
 
-impl<'a> Device<'a> for RawSocket {
-    type RxToken = RxToken;
-    type TxToken = TxToken;
+impl Device for RawSocket {
+    type RxBuffer = Vec<u8>;
+    type TxBuffer = TxBuffer;
 
-    fn capabilities(&self) -> DeviceCapabilities {
-        DeviceCapabilities {
-            max_transmission_unit: self.mtu,
-            ..DeviceCapabilities::default()
-        }
-    }
+    fn mtu(&self) -> usize { self.mtu }
 
-    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
+    fn receive(&mut self) -> Result<Self::RxBuffer, Error> {
         let mut lower = self.lower.borrow_mut();
         let mut buffer = vec![0; self.mtu];
-        match lower.recv(&mut buffer[..]) {
-            Ok(size) => {
-                buffer.resize(size, 0);
-                let rx = RxToken { buffer };
-                let tx = TxToken { lower: self.lower.clone() };
-                Some((rx, tx))
-            }
-            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                None
-            }
-            Err(err) => panic!("{}", err)
-        }
+        let size = lower.recv(&mut buffer[..]).unwrap();
+        buffer.resize(size, 0);
+        Ok(buffer)
     }
 
-    fn transmit(&'a mut self) -> Option<Self::TxToken> {
-        Some(TxToken {
-            lower: self.lower.clone(),
+    fn transmit(&mut self, length: usize) -> Result<Self::TxBuffer, Error> {
+        Ok(TxBuffer {
+            lower:  self.lower.clone(),
+            buffer: vec![0; length]
         })
     }
 }
 
 #[doc(hidden)]
-pub struct RxToken {
+pub struct TxBuffer {
+    lower:  Rc<RefCell<sys::RawSocketDesc>>,
     buffer: Vec<u8>
 }
 
-impl phy::RxToken for RxToken {
-    fn consume<R, F: FnOnce(&[u8]) -> Result<R>>(self, _timestamp: Instant, f: F) -> Result<R> {
-        f(&self.buffer[..])
-    }
+impl AsRef<[u8]> for TxBuffer {
+    fn as_ref(&self) -> &[u8] { self.buffer.as_ref() }
 }
 
-#[doc(hidden)]
-pub struct TxToken {
-    lower:  Rc<RefCell<sys::RawSocketDesc>>,
+impl AsMut<[u8]> for TxBuffer {
+    fn as_mut(&mut self) -> &mut [u8] { self.buffer.as_mut() }
 }
 
-impl phy::TxToken for TxToken {
-    fn consume<R, F: FnOnce(&mut [u8]) -> Result<R>>(self, _timestamp: Instant, len: usize, f: F)
-        -> Result<R>
-    {
+impl Drop for TxBuffer {
+    fn drop(&mut self) {
         let mut lower = self.lower.borrow_mut();
-        let mut buffer = vec![0; len];
-        let result = f(&mut buffer);
-        lower.send(&mut buffer[..]).unwrap();
-        result
+        lower.send(&mut self.buffer[..]).unwrap();
     }
 }

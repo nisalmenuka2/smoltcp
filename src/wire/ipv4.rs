@@ -1,36 +1,19 @@
 use core::fmt;
 use byteorder::{ByteOrder, NetworkEndian};
 
-use {Error, Result};
-use phy::ChecksumCapabilities;
-use super::ip::{checksum, pretty_print_ip_payload};
+use Error;
+use super::ip::checksum;
+use super::IpAddress;
 
 pub use super::IpProtocol as Protocol;
 
-/// Minimum MTU required of all links supporting IPv4. See [RFC 791 § 3.1].
-///
-/// [RFC 791 § 3.1]: https://tools.ietf.org/html/rfc791#section-3.1
-// RFC 791 states the following:
-//
-// > Every internet module must be able to forward a datagram of 68
-// > octets without further fragmentation... Every internet destination
-// > must be able to receive a datagram of 576 octets either in one piece
-// > or in fragments to be reassembled.
-//
-// As a result, we can assume that every host we send packets to can
-// accept a packet of the following size.
-pub const MIN_MTU: usize = 576;
-
 /// A four-octet IPv4 address.
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct Address(pub [u8; 4]);
 
 impl Address {
-    /// An unspecified address.
-    pub const UNSPECIFIED: Address = Address([0x00; 4]);
-
-    /// The broadcast address.
-    pub const BROADCAST:   Address = Address([0xff; 4]);
+    // pub const UNSPECIFIED: Address = Address([0x00; 4]);
+    // pub const BROADCAST:   Address = Address([0xff; 4]);
 
     /// Construct an IPv4 address from parts.
     pub fn new(a0: u8, a1: u8, a2: u8, a3: u8) -> Address {
@@ -85,20 +68,6 @@ impl Address {
     }
 }
 
-#[cfg(feature = "std")]
-impl From<::std::net::Ipv4Addr> for Address {
-    fn from(x: ::std::net::Ipv4Addr) -> Address {
-        Address(x.octets())
-    }
-}
-
-#[cfg(feature = "std")]
-impl From<Address> for ::std::net::Ipv4Addr {
-    fn from(Address(x): Address) -> ::std::net::Ipv4Addr {
-        x.into()
-    }
-}
-
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let bytes = self.0;
@@ -106,120 +75,8 @@ impl fmt::Display for Address {
     }
 }
 
-/// A specification of an IPv4 CIDR block, containing an address and a variable-length
-/// subnet masking prefix length.
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
-pub struct Cidr {
-    address:    Address,
-    prefix_len: u8,
-}
-
-impl Cidr {
-    /// Create an IPv4 CIDR block from the given address and prefix length.
-    ///
-    /// # Panics
-    /// This function panics if the prefix length is larger than 32.
-    pub fn new(address: Address, prefix_len: u8) -> Cidr {
-        assert!(prefix_len <= 32);
-        Cidr { address, prefix_len }
-    }
-
-    /// Create an IPv4 CIDR block from the given address and network mask.
-    pub fn from_netmask(addr: Address, netmask: Address) -> Result<Cidr> {
-        let netmask = NetworkEndian::read_u32(&netmask.0[..]);
-        if netmask.leading_zeros() == 0 && netmask.trailing_zeros() == netmask.count_zeros() {
-            Ok(Cidr { address: addr, prefix_len: netmask.count_ones() as u8 })
-        } else {
-            Err(Error::Illegal)
-        }
-    }
-
-    /// Return the address of this IPv4 CIDR block.
-    pub fn address(&self) -> Address {
-        self.address
-    }
-
-    /// Return the prefix length of this IPv4 CIDR block.
-    pub fn prefix_len(&self) -> u8 {
-        self.prefix_len
-    }
-
-    /// Return the network mask of this IPv4 CIDR.
-    pub fn netmask(&self) -> Address {
-        if self.prefix_len == 0 {
-            return Address([0, 0, 0, 0]);
-        }
-
-        let number = 0xffffffffu32 << (32 - self.prefix_len);
-        let data = [
-            ((number >> 24) & 0xff) as u8,
-            ((number >> 16) & 0xff) as u8,
-            ((number >>  8) & 0xff) as u8,
-            ((number >>  0) & 0xff) as u8,
-        ];
-
-        Address(data)
-    }
-
-    /// Return the broadcast address of this IPv4 CIDR.
-    pub fn broadcast(&self) -> Option<Address> {
-        let network = self.network();
-
-        if network.prefix_len == 31 || network.prefix_len == 32 {
-            return None;
-        }
-
-        let network_number = NetworkEndian::read_u32(&network.address.0[..]);
-        let number = network_number | 0xffffffffu32 >> network.prefix_len;
-        let data = [
-            ((number >> 24) & 0xff) as u8,
-            ((number >> 16) & 0xff) as u8,
-            ((number >>  8) & 0xff) as u8,
-            ((number >>  0) & 0xff) as u8,
-        ];
-
-        Some(Address(data))
-    }
-
-    /// Return the network block of this IPv4 CIDR.
-    pub fn network(&self) -> Cidr {
-        let mask = self.netmask().0;
-        let network = [
-            self.address.0[0] & mask[0],
-            self.address.0[1] & mask[1],
-            self.address.0[2] & mask[2],
-            self.address.0[3] & mask[3],
-        ];
-        Cidr { address: Address(network), prefix_len: self.prefix_len }
-    }
-
-    /// Query whether the subnetwork described by this IPv4 CIDR block contains
-    /// the given address.
-    pub fn contains_addr(&self, addr: &Address) -> bool {
-        // right shift by 32 is not legal
-        if self.prefix_len == 0 { return true }
-
-        let shift = 32 - self.prefix_len;
-        let self_prefix = NetworkEndian::read_u32(self.address.as_bytes()) >> shift;
-        let addr_prefix = NetworkEndian::read_u32(addr.as_bytes()) >> shift;
-        self_prefix == addr_prefix
-    }
-
-    /// Query whether the subnetwork described by this IPv4 CIDR block contains
-    /// the subnetwork described by the given IPv4 CIDR block.
-    pub fn contains_subnet(&self, subnet: &Cidr) -> bool {
-        self.prefix_len <= subnet.prefix_len && self.contains_addr(&subnet.address)
-    }
-}
-
-impl fmt::Display for Cidr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}/{}", self.address, self.prefix_len)
-    }
-}
-
 /// A read/write wrapper around an Internet Protocol version 4 packet buffer.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug)]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T
 }
@@ -240,47 +97,23 @@ mod field {
 }
 
 impl<T: AsRef<[u8]>> Packet<T> {
-    /// Imbue a raw octet buffer with IPv4 packet structure.
-    pub fn new(buffer: T) -> Packet<T> {
-        Packet { buffer }
-    }
-
-    /// Shorthand for a combination of [new] and [check_len].
-    ///
-    /// [new]: #method.new
-    /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: T) -> Result<Packet<T>> {
-        let packet = Self::new(buffer);
-        packet.check_len()?;
-        Ok(packet)
-    }
-
-    /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error::Truncated)` if the buffer is too short.
-    /// Returns `Err(Error::Malformed)` if the header length is greater
-    /// than total length.
-    ///
-    /// The result of this check is invalidated by calling [set_header_len]
-    /// and [set_total_len].
-    ///
-    /// [set_header_len]: #method.set_header_len
-    /// [set_total_len]: #method.set_total_len
-    pub fn check_len(&self) -> Result<()> {
-        let len = self.buffer.as_ref().len();
+    /// Wrap a buffer with an IPv4 packet. Returns an error if the buffer
+    /// is too small to contain one.
+    pub fn new(buffer: T) -> Result<Packet<T>, Error> {
+        let len = buffer.as_ref().len();
         if len < field::DST_ADDR.end {
             Err(Error::Truncated)
-        } else if len < self.header_len() as usize {
-            Err(Error::Truncated)
-        } else if self.header_len() as u16 > self.total_len() {
-            Err(Error::Malformed)
-        } else if len < self.total_len() as usize {
-            Err(Error::Truncated)
         } else {
-            Ok(())
+            let packet = Packet { buffer: buffer };
+            if len < packet.header_len() as usize {
+                Err(Error::Truncated)
+            } else {
+                Ok(packet)
+            }
         }
     }
 
-    /// Consume the packet, returning the underlying buffer.
+    /// Consumes the packet, returning the underlying buffer.
     pub fn into_inner(self) -> T {
         self.buffer
     }
@@ -348,7 +181,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the time to live field.
     #[inline]
-    pub fn hop_limit(&self) -> u8 {
+    pub fn ttl(&self) -> u8 {
         let data = self.buffer.as_ref();
         data[field::TTL]
     }
@@ -382,12 +215,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     }
 
     /// Validate the header checksum.
-    ///
-    /// # Fuzzing
-    /// This function always returns `true` when fuzzing.
     pub fn verify_checksum(&self) -> bool {
-        if cfg!(fuzzing) { return true }
-
         let data = self.buffer.as_ref();
         checksum::data(&data[..self.header_len() as usize]) == !0
     }
@@ -397,9 +225,9 @@ impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
     /// Return a pointer to the payload.
     #[inline]
     pub fn payload(&self) -> &'a [u8] {
-        let range = self.header_len() as usize..self.total_len() as usize;
+        let range = self.header_len() as usize;
         let data = self.buffer.as_ref();
-        &data[range]
+        &data[range..]
     }
 }
 
@@ -482,7 +310,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the time to live field.
     #[inline]
-    pub fn set_hop_limit(&mut self, value: u8) {
+    pub fn set_ttl(&mut self, value: u8) {
         let data = self.buffer.as_mut();
         data[field::TTL] = value
     }
@@ -524,19 +352,15 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
         };
         self.set_checksum(checksum)
     }
+}
 
+impl<'a, T: AsRef<[u8]> + AsMut<[u8]> + ?Sized> Packet<&'a mut T> {
     /// Return a mutable pointer to the payload.
     #[inline]
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        let range = self.header_len() as usize..self.total_len() as usize;
+        let range = self.header_len() as usize..;
         let data = self.buffer.as_mut();
         &mut data[range]
-    }
-}
-
-impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer.as_ref()
     }
 }
 
@@ -546,18 +370,18 @@ pub struct Repr {
     pub src_addr:    Address,
     pub dst_addr:    Address,
     pub protocol:    Protocol,
-    pub payload_len: usize,
-    pub hop_limit:   u8
+    pub payload_len: usize
 }
 
 impl Repr {
     /// Parse an Internet Protocol version 4 packet and return a high-level representation.
-    pub fn parse<T: AsRef<[u8]> + ?Sized>(packet: &Packet<&T>,
-                                          checksum_caps: &ChecksumCapabilities) -> Result<Repr> {
+    pub fn parse<T: AsRef<[u8]> + ?Sized>(packet: &Packet<&T>) -> Result<Repr, Error> {
         // Version 4 is expected.
         if packet.version() != 4 { return Err(Error::Malformed) }
         // Valid checksum is expected.
-        if checksum_caps.ipv4.rx() && !packet.verify_checksum() { return Err(Error::Checksum) }
+        if !packet.verify_checksum() { return Err(Error::Checksum) }
+        // We do not support any IP options.
+        if packet.header_len() > 20 { return Err(Error::Unrecognized) }
         // We do not support fragmentation.
         if packet.more_frags() || packet.frag_offset() != 0 { return Err(Error::Fragmented) }
         // Since the packet is not fragmented, it must include the entire payload.
@@ -571,8 +395,7 @@ impl Repr {
             src_addr:    packet.src_addr(),
             dst_addr:    packet.dst_addr(),
             protocol:    packet.protocol(),
-            payload_len: payload_len,
-            hop_limit:   packet.hop_limit()
+            payload_len: payload_len
         })
     }
 
@@ -583,7 +406,7 @@ impl Repr {
     }
 
     /// Emit a high-level representation into an Internet Protocol version 4 packet.
-    pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, packet: &mut Packet<T>, checksum_caps: &ChecksumCapabilities) {
+    pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, packet: &mut Packet<T>) {
         packet.set_version(4);
         packet.set_header_len(field::DST_ADDR.end as u8);
         packet.set_dscp(0);
@@ -595,53 +418,46 @@ impl Repr {
         packet.set_more_frags(false);
         packet.set_dont_frag(true);
         packet.set_frag_offset(0);
-        packet.set_hop_limit(self.hop_limit);
+        packet.set_ttl(64);
         packet.set_protocol(self.protocol);
         packet.set_src_addr(self.src_addr);
         packet.set_dst_addr(self.dst_addr);
-
-        if checksum_caps.ipv4.tx() {
-            packet.fill_checksum();
-        } else {
-            // make sure we get a consistently zeroed checksum,
-            // since implementations might rely on it
-            packet.set_checksum(0);
-        }
+        packet.fill_checksum();
     }
 }
 
 impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&'a T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match Repr::parse(self, &ChecksumCapabilities::ignored()) {
+        match Repr::parse(self) {
             Ok(repr) => write!(f, "{}", repr),
             Err(err) => {
-                write!(f, "IPv4 ({})", err)?;
-                write!(f, " src={} dst={} proto={} hop_limit={}",
-                       self.src_addr(), self.dst_addr(), self.protocol(), self.hop_limit())?;
+                try!(write!(f, "IPv4 ({})", err));
+                try!(write!(f, " src={} dst={} proto={} ttl={}",
+                            self.src_addr(), self.dst_addr(), self.protocol(), self.ttl()));
                 if self.version() != 4 {
-                    write!(f, " ver={}", self.version())?;
+                    try!(write!(f, " ver={}", self.version()))
                 }
                 if self.header_len() != 20 {
-                    write!(f, " hlen={}", self.header_len())?;
+                    try!(write!(f, " hlen={}", self.header_len()))
                 }
                 if self.dscp() != 0 {
-                    write!(f, " dscp={}", self.dscp())?;
+                    try!(write!(f, " dscp={}", self.dscp()))
                 }
                 if self.ecn() != 0 {
-                    write!(f, " ecn={}", self.ecn())?;
+                    try!(write!(f, " ecn={}", self.ecn()))
                 }
-                write!(f, " tlen={}", self.total_len())?;
+                try!(write!(f, " tlen={}", self.total_len()));
                 if self.dont_frag() {
-                    write!(f, " df")?;
+                    try!(write!(f, " df"))
                 }
                 if self.more_frags() {
-                    write!(f, " mf")?;
+                    try!(write!(f, " mf"))
                 }
                 if self.frag_offset() != 0 {
-                    write!(f, " off={}", self.frag_offset())?;
+                    try!(write!(f, " off={}", self.frag_offset()))
                 }
                 if self.more_frags() || self.frag_offset() != 0 {
-                    write!(f, " id={}", self.ident())?;
+                    try!(write!(f, " id={}", self.ident()))
                 }
                 Ok(())
             }
@@ -661,25 +477,49 @@ use super::pretty_print::{PrettyPrint, PrettyIndent};
 impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
     fn pretty_print(buffer: &AsRef<[u8]>, f: &mut fmt::Formatter,
                     indent: &mut PrettyIndent) -> fmt::Result {
-        use wire::ip::checksum::format_checksum;
-
-        let checksum_caps = ChecksumCapabilities::ignored();
-
-        let (ip_repr, payload) = match Packet::new_checked(buffer) {
-            Err(err) => return write!(f, "{}({})", indent, err),
+        let (ip_repr, payload) = match Packet::new(buffer) {
+            Err(err) => return write!(f, "{}({})\n", indent, err),
             Ok(ip_packet) => {
-                match Repr::parse(&ip_packet, &checksum_caps) {
+                try!(write!(f, "{}{}\n", indent, ip_packet));
+                match Repr::parse(&ip_packet) {
                     Err(_) => return Ok(()),
-                    Ok(ip_repr) => {
-                        write!(f, "{}{}", indent, ip_repr)?;
-                        format_checksum(f, ip_packet.verify_checksum())?;
-                        (ip_repr, ip_packet.payload())
-                    }
+                    Ok(ip_repr) => (ip_repr, &ip_packet.payload()[..ip_repr.payload_len])
                 }
             }
         };
 
-        pretty_print_ip_payload(f, indent, ip_repr, payload)
+        indent.increase();
+        match ip_repr.protocol {
+            Protocol::Icmp =>
+                super::Icmpv4Packet::<&[u8]>::pretty_print(&payload, f, indent),
+            Protocol::Udp => {
+                match super::UdpPacket::new(payload) {
+                    Err(err) => write!(f, "{}({})\n", indent, err),
+                    Ok(udp_packet) => {
+                        match super::UdpRepr::parse(&udp_packet,
+                                                    &IpAddress::from(ip_repr.src_addr),
+                                                    &IpAddress::from(ip_repr.dst_addr)) {
+                            Err(err) => write!(f, "{}{} ({})\n", indent, udp_packet, err),
+                            Ok(udp_repr) => write!(f, "{}{}\n", indent, udp_repr)
+                        }
+                    }
+                }
+            }
+            Protocol::Tcp => {
+                match super::TcpPacket::new(payload) {
+                    Err(err) => write!(f, "{}({})\n", indent, err),
+                    Ok(tcp_packet) => {
+                        match super::TcpRepr::parse(&tcp_packet,
+                                                    &IpAddress::from(ip_repr.src_addr),
+                                                    &IpAddress::from(ip_repr.dst_addr)) {
+                            Err(err) => write!(f, "{}{} ({})\n", indent, tcp_packet, err),
+                            Ok(tcp_repr) => write!(f, "{}{}\n", indent, tcp_repr)
+                        }
+                    }
+                }
+            }
+            _ => Ok(())
+        }
     }
 }
 
@@ -704,7 +544,7 @@ mod test {
 
     #[test]
     fn test_deconstruct() {
-        let packet = Packet::new(&PACKET_BYTES[..]);
+        let packet = Packet::new(&PACKET_BYTES[..]).unwrap();
         assert_eq!(packet.version(), 4);
         assert_eq!(packet.header_len(), 20);
         assert_eq!(packet.dscp(), 0);
@@ -714,7 +554,7 @@ mod test {
         assert_eq!(packet.more_frags(), true);
         assert_eq!(packet.dont_frag(), true);
         assert_eq!(packet.frag_offset(), 0x203 * 8);
-        assert_eq!(packet.hop_limit(), 0x1a);
+        assert_eq!(packet.ttl(), 0x1a);
         assert_eq!(packet.protocol(), Protocol::Icmp);
         assert_eq!(packet.checksum(), 0xd56e);
         assert_eq!(packet.src_addr(), Address([0x11, 0x12, 0x13, 0x14]));
@@ -725,11 +565,10 @@ mod test {
 
     #[test]
     fn test_construct() {
-        let mut bytes = vec![0xa5; 30];
-        let mut packet = Packet::new(&mut bytes);
+        let mut bytes = vec![0; 30];
+        let mut packet = Packet::new(&mut bytes).unwrap();
         packet.set_version(4);
         packet.set_header_len(20);
-        packet.clear_flags();
         packet.set_dscp(0);
         packet.set_ecn(0);
         packet.set_total_len(30);
@@ -737,35 +576,13 @@ mod test {
         packet.set_more_frags(true);
         packet.set_dont_frag(true);
         packet.set_frag_offset(0x203 * 8);
-        packet.set_hop_limit(0x1a);
+        packet.set_ttl(0x1a);
         packet.set_protocol(Protocol::Icmp);
         packet.set_src_addr(Address([0x11, 0x12, 0x13, 0x14]));
         packet.set_dst_addr(Address([0x21, 0x22, 0x23, 0x24]));
         packet.fill_checksum();
         packet.payload_mut().copy_from_slice(&PAYLOAD_BYTES[..]);
         assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
-    }
-
-    #[test]
-    fn test_overlong() {
-        let mut bytes = vec![];
-        bytes.extend(&PACKET_BYTES[..]);
-        bytes.push(0);
-
-        assert_eq!(Packet::new(&bytes).payload().len(),
-                   PAYLOAD_BYTES.len());
-        assert_eq!(Packet::new(&mut bytes).payload_mut().len(),
-                   PAYLOAD_BYTES.len());
-    }
-
-    #[test]
-    fn test_total_len_overflow() {
-        let mut bytes = vec![];
-        bytes.extend(&PACKET_BYTES[..]);
-        Packet::new(&mut bytes).set_total_len(128);
-
-        assert_eq!(Packet::new_checked(&bytes).unwrap_err(),
-                   Error::Truncated);
     }
 
     static REPR_PACKET_BYTES: [u8; 24] =
@@ -784,205 +601,24 @@ mod test {
             src_addr:    Address([0x11, 0x12, 0x13, 0x14]),
             dst_addr:    Address([0x21, 0x22, 0x23, 0x24]),
             protocol:    Protocol::Icmp,
-            payload_len: 4,
-            hop_limit:   64
+            payload_len: 4
         }
     }
 
     #[test]
     fn test_parse() {
-        let packet = Packet::new(&REPR_PACKET_BYTES[..]);
-        let repr = Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap();
+        let packet = Packet::new(&REPR_PACKET_BYTES[..]).unwrap();
+        let repr = Repr::parse(&packet).unwrap();
         assert_eq!(repr, packet_repr());
-    }
-
-    #[test]
-    fn test_parse_bad_version() {
-        let mut bytes = vec![0; 24];
-        bytes.copy_from_slice(&REPR_PACKET_BYTES[..]);
-        let mut packet = Packet::new(&mut bytes);
-        packet.set_version(6);
-        packet.fill_checksum();
-        let packet = Packet::new(&*packet.into_inner());
-        assert_eq!(Repr::parse(&packet, &ChecksumCapabilities::default()), Err(Error::Malformed));
-    }
-
-    #[test]
-    fn test_parse_total_len_less_than_header_len() {
-        let mut bytes = vec![0; 40];
-        bytes[0] = 0x09;
-        assert_eq!(Packet::new_checked(&mut bytes), Err(Error::Malformed));
     }
 
     #[test]
     fn test_emit() {
         let repr = packet_repr();
-        let mut bytes = vec![0xa5; repr.buffer_len() + REPR_PAYLOAD_BYTES.len()];
-        let mut packet = Packet::new(&mut bytes);
-        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        let mut bytes = vec![0; repr.buffer_len() + REPR_PAYLOAD_BYTES.len()];
+        let mut packet = Packet::new(&mut bytes).unwrap();
+        repr.emit(&mut packet);
         packet.payload_mut().copy_from_slice(&REPR_PAYLOAD_BYTES);
         assert_eq!(&packet.into_inner()[..], &REPR_PACKET_BYTES[..]);
-    }
-
-    #[test]
-    fn test_unspecified() {
-        assert!(Address::UNSPECIFIED.is_unspecified());
-        assert!(!Address::UNSPECIFIED.is_broadcast());
-        assert!(!Address::UNSPECIFIED.is_multicast());
-        assert!(!Address::UNSPECIFIED.is_link_local());
-        assert!(!Address::UNSPECIFIED.is_loopback());
-    }
-
-    #[test]
-    fn test_broadcast() {
-        assert!(!Address::BROADCAST.is_unspecified());
-        assert!(Address::BROADCAST.is_broadcast());
-        assert!(!Address::BROADCAST.is_multicast());
-        assert!(!Address::BROADCAST.is_link_local());
-        assert!(!Address::BROADCAST.is_loopback());
-    }
-
-    #[test]
-    fn test_cidr() {
-        let cidr = Cidr::new(Address::new(192, 168, 1, 10), 24);
-
-        let inside_subnet = [
-            [192, 168,   1,   0], [192, 168,   1,   1],
-            [192, 168,   1,   2], [192, 168,   1,  10],
-            [192, 168,   1, 127], [192, 168,   1, 255],
-        ];
-
-        let outside_subnet = [
-            [192, 168,   0,   0], [127,   0,   0,   1],
-            [192, 168,   2,   0], [192, 168,   0, 255],
-            [  0,   0,   0,   0], [255, 255, 255, 255],
-        ];
-
-        let subnets = [
-            ([192, 168,   1,   0], 32),
-            ([192, 168,   1, 255], 24),
-            ([192, 168,   1,  10], 30),
-        ];
-
-        let not_subnets = [
-            ([192, 168,   1,  10], 23),
-            ([127,   0,   0,   1],  8),
-            ([192, 168,   1,   0],  0),
-            ([192, 168,   0, 255], 32),
-        ];
-
-        for addr in inside_subnet.iter().map(|a| Address::from_bytes(a)) {
-            assert!(cidr.contains_addr(&addr));
-        }
-
-        for addr in outside_subnet.iter().map(|a| Address::from_bytes(a)) {
-            assert!(!cidr.contains_addr(&addr));
-        }
-
-        for subnet in subnets.iter().map(
-            |&(a, p)| Cidr::new(Address::new(a[0], a[1], a[2], a[3]), p)) {
-            assert!(cidr.contains_subnet(&subnet));
-        }
-
-        for subnet in not_subnets.iter().map(
-            |&(a, p)| Cidr::new(Address::new(a[0], a[1], a[2], a[3]), p)) {
-            assert!(!cidr.contains_subnet(&subnet));
-        }
-
-        let cidr_without_prefix = Cidr::new(cidr.address(), 0);
-        assert!(cidr_without_prefix.contains_addr(&Address::new(127, 0, 0, 1)));
-    }
-
-    #[test]
-    fn test_cidr_from_netmask() {
-        assert_eq!(Cidr::from_netmask(Address([0, 0, 0, 0]), Address([1, 0, 2, 0])).is_err(),
-                   true);
-        assert_eq!(Cidr::from_netmask(Address([0, 0, 0, 0]), Address([0, 0, 0, 0])).is_err(),
-                   true);
-        assert_eq!(Cidr::from_netmask(Address([0, 0, 0, 1]), Address([255, 255, 255, 0])).unwrap(),
-                   Cidr::new(Address([0, 0, 0, 1]), 24));
-        assert_eq!(Cidr::from_netmask(Address([192, 168, 0, 1]), Address([255, 255, 0, 0])).unwrap(),
-                   Cidr::new(Address([192, 168, 0, 1]), 16));
-        assert_eq!(Cidr::from_netmask(Address([172, 16, 0, 1]), Address([255, 240, 0, 0])).unwrap(),
-                   Cidr::new(Address([172, 16, 0, 1]), 12));
-        assert_eq!(Cidr::from_netmask(Address([255, 255, 255, 1]), Address([255, 255, 255, 0])).unwrap(),
-                   Cidr::new(Address([255, 255, 255, 1]), 24));
-        assert_eq!(Cidr::from_netmask(Address([255, 255, 255, 255]), Address([255, 255, 255, 255])).unwrap(),
-                   Cidr::new(Address([255, 255, 255, 255]), 32));
-    }
-
-    #[test]
-    fn test_cidr_netmask() {
-        assert_eq!(Cidr::new(Address([0, 0, 0, 0]), 0).netmask(),
-                   Address([0, 0, 0, 0]));
-        assert_eq!(Cidr::new(Address([0, 0, 0, 1]), 24).netmask(),
-                   Address([255, 255, 255, 0]));
-        assert_eq!(Cidr::new(Address([0, 0, 0, 0]), 32).netmask(),
-                   Address([255, 255, 255, 255]));
-        assert_eq!(Cidr::new(Address([127, 0, 0, 0]), 8).netmask(),
-                   Address([255, 0, 0, 0]));
-        assert_eq!(Cidr::new(Address([192, 168, 0, 0]), 16).netmask(),
-                   Address([255, 255, 0, 0]));
-        assert_eq!(Cidr::new(Address([192, 168, 1, 1]), 16).netmask(),
-                   Address([255, 255, 0, 0]));
-        assert_eq!(Cidr::new(Address([192, 168, 1, 1]), 17).netmask(),
-                   Address([255, 255, 128, 0]));
-        assert_eq!(Cidr::new(Address([172, 16, 0, 0]), 12).netmask(),
-                   Address([255, 240, 0, 0]));
-        assert_eq!(Cidr::new(Address([255, 255, 255, 1]), 24).netmask(),
-                   Address([255, 255, 255, 0]));
-        assert_eq!(Cidr::new(Address([255, 255, 255, 255]), 32).netmask(),
-                   Address([255, 255, 255, 255]));
-    }
-
-    #[test]
-    fn test_cidr_broadcast() {
-        assert_eq!(Cidr::new(Address([0, 0, 0, 0]), 0).broadcast().unwrap(),
-                   Address([255, 255, 255, 255]));
-        assert_eq!(Cidr::new(Address([0, 0, 0, 1]), 24).broadcast().unwrap(),
-                   Address([0, 0, 0, 255]));
-        assert_eq!(Cidr::new(Address([0, 0, 0, 0]), 32).broadcast(),
-                   None);
-        assert_eq!(Cidr::new(Address([127, 0, 0, 0]), 8).broadcast().unwrap(),
-                   Address([127, 255, 255, 255]));
-        assert_eq!(Cidr::new(Address([192, 168, 0, 0]), 16).broadcast().unwrap(),
-                   Address([192, 168, 255, 255]));
-        assert_eq!(Cidr::new(Address([192, 168, 1, 1]), 16).broadcast().unwrap(),
-                   Address([192, 168, 255, 255]));
-        assert_eq!(Cidr::new(Address([192, 168, 1, 1]), 17).broadcast().unwrap(),
-                   Address([192, 168, 127, 255]));
-        assert_eq!(Cidr::new(Address([172, 16, 0, 1]), 12).broadcast().unwrap(),
-                   Address([172, 31, 255, 255]));
-        assert_eq!(Cidr::new(Address([255, 255, 255, 1]), 24).broadcast().unwrap(),
-                   Address([255, 255, 255, 255]));
-        assert_eq!(Cidr::new(Address([255, 255, 255, 254]), 31).broadcast(),
-                   None);
-        assert_eq!(Cidr::new(Address([255, 255, 255, 255]), 32).broadcast(),
-                   None);
-
-    }
-
-    #[test]
-    fn test_cidr_network() {
-        assert_eq!(Cidr::new(Address([0, 0, 0, 0]), 0).network(),
-                   Cidr::new(Address([0, 0, 0, 0]), 0));
-        assert_eq!(Cidr::new(Address([0, 0, 0, 1]), 24).network(),
-                   Cidr::new(Address([0, 0, 0, 0]), 24));
-        assert_eq!(Cidr::new(Address([0, 0, 0, 0]), 32).network(),
-                   Cidr::new(Address([0, 0, 0, 0]), 32));
-        assert_eq!(Cidr::new(Address([127, 0, 0, 0]), 8).network(),
-                   Cidr::new(Address([127, 0, 0, 0]), 8));
-        assert_eq!(Cidr::new(Address([192, 168, 0, 0]), 16).network(),
-                   Cidr::new(Address([192, 168, 0, 0]), 16));
-        assert_eq!(Cidr::new(Address([192, 168, 1, 1]), 16).network(),
-                   Cidr::new(Address([192, 168, 0, 0]), 16));
-        assert_eq!(Cidr::new(Address([192, 168, 1, 1]), 17).network(),
-                   Cidr::new(Address([192, 168, 0, 0]), 17));
-        assert_eq!(Cidr::new(Address([172,  16, 0, 1]), 12).network(),
-                   Cidr::new(Address([172,  16, 0, 0]), 12));
-        assert_eq!(Cidr::new(Address([255, 255, 255, 1]), 24).network(),
-                   Cidr::new(Address([255, 255, 255, 0]), 24));
-        assert_eq!(Cidr::new(Address([255, 255, 255, 255]), 32).network(),
-                   Cidr::new(Address([255, 255, 255, 255]), 32));
     }
 }

@@ -1,33 +1,38 @@
 #[cfg(feature = "log")]
-#[macro_use]
-mod log {
-    macro_rules! net_log {
-        (trace, $($arg:expr),*) => { trace!($($arg),*); };
-        (debug, $($arg:expr),*) => { debug!($($arg),*); };
-    }
+macro_rules! net_log_enabled {
+    (trace) => (log_enabled!($crate::log::LogLevel::Trace));
+    (debug) => (log_enabled!($crate::log::LogLevel::Debug));
 }
 
 #[cfg(not(feature = "log"))]
-#[macro_use]
-mod log {
-    macro_rules! net_log {
-        ($level:ident, $($arg:expr),*) => { $( let _ = $arg; )* }
-    }
+macro_rules! net_log_enabled {
+    (trace) => (false);
+    (debug) => (false);
 }
 
 macro_rules! net_trace {
-    ($($arg:expr),*) => (net_log!(trace, $($arg),*));
+    ($($arg:expr),*) => {{
+        #[cfg(feature = "log")]
+        trace!($($arg),*);
+        #[cfg(not(feature = "log"))]
+        $( let _ = $arg );*; // suppress unused variable warnings
+    }}
 }
 
 macro_rules! net_debug {
-    ($($arg:expr),*) => (net_log!(debug, $($arg),*));
+    ($($arg:expr),*) => {{
+        #[cfg(feature = "log")]
+        debug!($($arg),*);
+        #[cfg(not(feature = "log"))]
+        $( let _ = $arg );*; // suppress unused variable warnings
+    }}
 }
 
 macro_rules! enum_with_unknown {
     (
         $( #[$enum_attr:meta] )*
         pub enum $name:ident($ty:ty) {
-            $( $variant:ident = $value:expr ),+ $(,)*
+            $( $variant:ident = $value:expr ),+
         }
     ) => {
         enum_with_unknown! {
@@ -42,7 +47,7 @@ macro_rules! enum_with_unknown {
         pub doc enum $name:ident($ty:ty) {
             $(
               $( #[$variant_attr:meta] )+
-              $variant:ident = $value:expr $(,)*
+              $variant:ident = $value:expr
             ),+
         }
     ) => {

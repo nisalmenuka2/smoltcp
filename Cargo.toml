@@ -1,6 +1,6 @@
 [package]
 name = "smoltcp"
-version = "0.4.0"
+version = "0.3.0"
 authors = ["whitequark <whitequark@whitequark.org>"]
 description = "A TCP/IP stack designed for bare-metal, real-time systems without a heap."
 documentation = "https://docs.rs/smoltcp/"
@@ -10,74 +10,35 @@ readme = "README.md"
 keywords = ["ip", "tcp", "udp", "ethernet", "network"]
 categories = ["embedded"]
 license = "0BSD"
-# Each example should have an explicit `[[example]]` section here to
-# ensure that the correct features are enabled.
-autoexamples = false
 
 [dependencies]
-managed = { version = "0.5", default-features = false, features = ["map"] }
 byteorder = { version = "1.0", default-features = false }
+#managed = { path = "../smoltcp/libs/rust-managed", version = "0.3.0", default-features = false, features = ["alloc"] }
+managed = { path = "libs/rust-managed", version = "0.3.0", default-features = false, features = ["alloc"]}
 log = { version = "0.3", default-features = false, optional = true }
 libc = { version = "0.2.18", optional = true }
-bitflags = { version = "1.0", default-features = false }
 
 [dev-dependencies]
+log = "0.3"
 env_logger = "0.4"
 getopts = "0.2"
-rand = "0.3"
-url = "1.0"
 
 [features]
-std = ["managed/std"]
+std = ["managed/std", "libc"]
 alloc = ["managed/alloc"]
-verbose = []
-"phy-raw_socket" = ["std", "libc"]
-"phy-tap_interface" = ["std", "libc"]
-"proto-ipv4" = []
-"proto-ipv6" = []
-"socket-raw" = []
-"socket-udp" = []
-"socket-tcp" = []
-"socket-icmp" = []
-default = [
-  "std", "log", # needed for `cargo test --no-default-features --features default` :/
-  "phy-raw_socket", "phy-tap_interface",
-  "proto-ipv4", "proto-ipv6",
-  "socket-raw", "socket-icmp", "socket-udp", "socket-tcp"
-]
+collections = ["managed/collections"]
 
-[[example]]
-name = "packet2pcap"
-path = "utils/packet2pcap.rs"
-required-features = ["std"]
+#collections = ["collections"]
+#alloc = ["alloc"]
+#std = ["std", "libc"]
+verbose = []
+default = ["std", "log", "verbose"]
 
 [[example]]
 name = "tcpdump"
-required-features = ["std", "phy-raw_socket", "proto-ipv4"]
-
-[[example]]
-name = "httpclient"
-required-features = ["std", "phy-tap_interface", "proto-ipv4", "proto-ipv6", "socket-tcp"]
-
-[[example]]
-name = "ping"
-required-features = ["std", "phy-tap_interface", "proto-ipv4", "proto-ipv6", "socket-icmp"]
 
 [[example]]
 name = "server"
-required-features = ["std", "phy-tap_interface", "proto-ipv4", "socket-tcp", "socket-udp"]
 
 [[example]]
 name = "client"
-required-features = ["std", "phy-tap_interface", "proto-ipv4", "socket-tcp", "socket-udp"]
-
-[[example]]
-name = "loopback"
-required-features = ["log", "proto-ipv4", "socket-tcp"]
-
-[[example]]
-name = "benchmark"
-required-features = ["std", "phy-tap_interface", "proto-ipv4", "socket-tcp"]
-
-[profile.release]
-debug = 2
