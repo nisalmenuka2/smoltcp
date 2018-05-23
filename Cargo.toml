@@ -13,8 +13,7 @@ license = "0BSD"
 
 [dependencies]
 byteorder = { version = "1.0", default-features = false }
-#managed = { path = "../smoltcp/libs/rust-managed", version = "0.3.0", default-features = false, features = ["alloc"] }
-managed = { path = "libs/rust-managed", version = "0.3.0", default-features = false, features = ["alloc"]}
+managed = { path = "../rust-managed", version = "0.3.0", default-features = false, features = ["alloc"]}
 log = { version = "0.3", default-features = false, optional = true }
 libc = { version = "0.2.18", optional = true }
 
